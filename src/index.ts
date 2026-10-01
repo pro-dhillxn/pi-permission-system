@@ -14,6 +14,7 @@ import {
   PERMISSION_SYSTEM_COMMAND_DESCRIPTION,
   toRecord,
 } from "./common.js";
+import { resolveActiveTools } from "./active-tools.js";
 import {
   createActiveToolsCacheKey,
   createBeforeAgentStartPromptStateKey,
@@ -1337,6 +1338,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   const explicitlyRequestedSkillNames = new Set<string>();
   let lastKnownActiveAgentName: string | null = null;
   let lastActiveToolsCacheKey: string | null = null;
+  let toolsHiddenByPolicy = new Set<string>();
   let lastPromptStateCacheKey: string | null = null;
   let lastPromptStateCacheResult: CachedPromptStateResult | null = null;
   let permissionForwardingContext: ExtensionContext | null = null;
@@ -1903,6 +1905,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     explicitlyRequestedSkillNames.clear();
     runtimeApi = null;
     invalidateAgentStartCache();
+    toolsHiddenByPolicy = new Set<string>();
     stopForwardedPermissionPolling();
   });
 
@@ -1912,23 +1915,52 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     startForwardedPermissionPolling(ctx);
     const agentName = resolveAgentName(ctx, event.systemPrompt);
     const allTools = pi.getAllTools();
-    const allowedTools: string[] = [];
+    let allowedTools: string[] = [];
 
-    for (const tool of allTools) {
-      const toolName = getEventToolName(tool);
-      if (!toolName) {
-        continue;
+    if (typeof pi.getActiveTools === "function") {
+      // Only remove denied tools from Pi's active set. Activating every registered tool would
+      // override `defaultTools` and declare `codemode`/`deferred` tools (such as MCP tools) that
+      // Pi keeps inactive until codemode or tool_search reaches them.
+      const registeredToolNames = new Set<string>();
+      for (const tool of allTools) {
+        const toolName = getEventToolName(tool);
+        if (toolName) {
+          registeredToolNames.add(toolName);
+        }
       }
 
-      if (shouldExposeTool(toolName, agentName)) {
-        allowedTools.push(toolName);
-      }
-    }
+      const activeTools = pi.getActiveTools();
+      const resolved = resolveActiveTools({
+        activeToolNames: activeTools,
+        registeredToolNames,
+        hiddenByPolicy: toolsHiddenByPolicy,
+        isToolExposed: (toolName) => shouldExposeTool(toolName, agentName),
+      });
+      toolsHiddenByPolicy = resolved.hiddenByPolicy;
+      allowedTools = resolved.activeToolNames;
 
-    const activeToolsCacheKey = createActiveToolsCacheKey(allowedTools);
-    if (shouldApplyCachedAgentStartState(lastActiveToolsCacheKey, activeToolsCacheKey)) {
-      pi.setActiveTools(allowedTools);
-      lastActiveToolsCacheKey = activeToolsCacheKey;
+      // Each active set change is recorded in the transcript, so only apply real changes.
+      if (resolved.changed) {
+        pi.setActiveTools(allowedTools);
+      }
+    } else {
+      // Pi versions without getActiveTools(): expose every registered tool policy allows.
+      for (const tool of allTools) {
+        const toolName = getEventToolName(tool);
+        if (!toolName) {
+          continue;
+        }
+
+        if (shouldExposeTool(toolName, agentName)) {
+          allowedTools.push(toolName);
+        }
+      }
+
+      const activeToolsCacheKey = createActiveToolsCacheKey(allowedTools);
+      if (shouldApplyCachedAgentStartState(lastActiveToolsCacheKey, activeToolsCacheKey)) {
+        pi.setActiveTools(allowedTools);
+        lastActiveToolsCacheKey = activeToolsCacheKey;
+      }
     }
 
     const promptStateCacheKey = createBeforeAgentStartPromptStateKey({
